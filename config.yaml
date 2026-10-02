@@ -1,0 +1,79 @@
+# =============================================================================
+#  CONFIGURAZIONE — NY Liquidity Sweep Bot (Alpaca paper trading)
+# -----------------------------------------------------------------------------
+#  Tutti i valori marcati [RICERCA] vanno calibrati sui dati del report
+#  RICERCA.txt. I valori qui sotto sono default CONSERVATIVI di partenza.
+#  I parametri elencati in `coach.tunable` possono essere modificati
+#  automaticamente da ai_coach.py, ma SOLO dentro i limiti min/max indicati.
+# =============================================================================
+
+broker:
+  paper: true                 # MAI false finché il sistema non è validato
+  data_feed: iex              # iex (gratuito) | sip (abbonamento)
+
+session:
+  timezone: America/New_York
+  premarket_start: "04:00"    # inizio range pre-market (livelli di liquidità)
+  rth_open: "09:30"
+  killzone_start: "09:35"     # [RICERCA] finestra in cui cerchiamo lo sweep
+  killzone_end: "11:00"       # [RICERCA]
+  flatten_time: "15:50"       # chiusura forzata di tutte le posizioni
+  rth_close: "16:00"
+
+strategy:
+  symbols: [SPY, QQQ]
+  timeframe_minutes: 5
+  atr_period: 14
+  # Livelli di liquidità considerati per lo sweep
+  levels: [PDH, PDL, PMH, PML]      # Prev Day High/Low, PreMarket High/Low
+  sweep_min_penetration_atr: 0.05   # [RICERCA] wick oltre il livello di almeno X*ATR
+  sweep_max_penetration_atr: 1.00   # [RICERCA] oltre = breakout reale, non sweep
+  reclaim_max_bars: 2               # [RICERCA] barre entro cui deve chiudere di nuovo dentro
+  displacement_body_atr: 0.50       # [RICERCA] corpo minimo candela di conferma (x ATR)
+  min_volume_ratio: 1.20            # [RICERCA] volume barra sweep / media 20 barre
+  one_trade_per_level: true
+
+risk:
+  risk_per_trade_pct: 0.50          # [RICERCA] % equity rischiata per trade
+  atr_stop_mult: 1.50               # [RICERCA] stop minimo = entry -/+ k*ATR
+  stop_buffer_atr: 0.10             # buffer oltre l'estremo dello sweep
+  take_profit_r: 2.00               # [RICERCA] TP in multipli di R
+  min_rr_after_clip: 1.00           # se il TP tagliato dalla consistency scende sotto, salta il trade
+  breakeven_at_r: 1.00              # sposta lo stop a breakeven a +1R
+  trail_atr_mult: 1.00              # poi trailing a k*ATR dal prezzo
+  daily_loss_limit_pct: 2.00        # [RICERCA] stop di giornata in perdita
+  daily_profit_target_pct: 1.50     # [RICERCA] obiettivo giornaliero: raggiunto => stop
+  max_trades_per_day: 3
+  max_consecutive_losses: 2
+  max_position_notional_pct: 50.0   # cap esposizione per singola posizione
+
+consistency:
+  # Consistency Rule (stile prop firm): nessun giorno può valere più di
+  # `max_day_share` del profitto totale. [RICERCA]
+  enabled: true
+  max_day_share: 0.30               # [RICERCA] es. 30%
+  profit_target_pct: 8.00           # [RICERCA] obiettivo totale del periodo di valutazione
+  safety_margin: 0.90               # usa solo il 90% del budget consentito
+  starting_equity: null             # null = equity al primo avvio (salvata in state/)
+
+coach:
+  model: claude-opus-5-5
+  effort: high
+  lookback_trades: 30
+  min_trades_required: 10           # sotto questa soglia il coach non modifica nulla
+  max_relative_change: 0.20         # max ±20% per parametro per iterazione
+  max_changes_per_run: 3
+  rollback_if_expectancy_drops_r: 0.15   # rollback se l'expectancy (R) peggiora oltre questa soglia
+  use_server_fallbacks: true
+  tunable:                          # unico perimetro modificabile dall'AI
+    strategy.sweep_min_penetration_atr: {min: 0.02, max: 0.30}
+    strategy.reclaim_max_bars:          {min: 1,    max: 4, integer: true}
+    strategy.displacement_body_atr:     {min: 0.20, max: 1.20}
+    strategy.min_volume_ratio:          {min: 1.00, max: 2.50}
+    risk.atr_stop_mult:                 {min: 1.00, max: 3.00}
+    risk.take_profit_r:                 {min: 1.00, max: 4.00}
+    risk.breakeven_at_r:                {min: 0.50, max: 2.00}
+    risk.trail_atr_mult:                {min: 0.50, max: 2.50}
+    risk.daily_profit_target_pct:       {min: 0.50, max: 2.50}
+    risk.risk_per_trade_pct:            {min: 0.10, max: 1.00}
+    risk.max_trades_per_day:            {min: 1,    max: 5, integer: true}
