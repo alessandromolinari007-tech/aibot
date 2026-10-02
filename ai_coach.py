@@ -28,6 +28,7 @@ from pydantic import BaseModel, ValidationError
 
 from bot import journal
 from bot.config import OVERRIDES_PATH, ROOT, clamp_value, get_path, load_config
+from bot.validation import deflated_sharpe_ratio
 
 log = logging.getLogger("ai_coach")
 SYSTEM_PROMPT_PATH = ROOT / "prompts" / "coach_system_prompt.md"
@@ -35,9 +36,19 @@ SYSTEM_PROMPT_PATH = ROOT / "prompts" / "coach_system_prompt.md"
 # Campi del journal inviati al modello (niente rumore, niente order id).
 TRADE_FIELDS = [
     "trade_id", "day", "time_et", "symbol", "side", "level", "penetration_atr", "atr",
-    "planned_r", "tp_clipped_by_consistency", "exit_reason", "r_multiple", "pnl",
-    "mfe_r", "mae_r", "day_realized_after", "day_profit_cap",
+    "ofi_ratio", "cvd_divergence", "planned_r", "tp_clipped_by_consistency", "friction_share",
+    "exit_reason", "r_multiple", "pnl", "mfe_r", "mae_r", "day_realized_after", "day_profit_cap",
 ]
+
+
+def n_trials(state: dict) -> int:
+    """Configurazioni testate finora (base + ogni modifica del coach): N del DSR."""
+    return 1 + len(state["history"])
+
+
+def edge_validated(cfg: dict, trades: list[dict], state: dict) -> tuple[float, bool]:
+    dsr = deflated_sharpe_ratio([float(t.get("r_multiple", 0.0)) for t in trades], n_trials(state))
+    return round(dsr, 4), dsr >= cfg["validation"]["dsr_confidence"]
 
 
 # ------------------------------------------------------------------ schema
@@ -124,7 +135,7 @@ def evaluate_trial(state: dict, all_trades: list[dict], coach_cfg: dict) -> str 
     new = journal.compute_stats(after)
     base_exp = last["baseline_stats"]["expectancy_r"]
     # Anche una Consistency peggiorata oltre il limite è motivo di rollback.
-    limit = last.get("max_day_share", 1.0)
+    limit = last.get("consistency_threshold", 1.0)
     consistency_worse = new.best_day_share > max(limit, last["baseline_stats"]["best_day_share"])
     if new.expectancy_r < base_exp - coach_cfg["rollback_if_expectancy_drops_r"] or consistency_worse:
         state["active"] = last["previous_active"]
@@ -154,13 +165,20 @@ def build_user_message(cfg: dict, trades: list[dict], state: dict) -> str:
         for k, bounds in c["tunable"].items()
     }
     fixed = {
+        "prop_firm": cfg["prop_firm"],
+        "account_drawdown": cfg["account_drawdown"],
         "risk.daily_loss_limit_pct": cfg["risk"]["daily_loss_limit_pct"],
+        "risk.dll_friction_buffer": cfg["risk"]["dll_friction_buffer"],
         "risk.max_consecutive_losses": cfg["risk"]["max_consecutive_losses"],
         "risk.min_rr_after_clip": cfg["risk"]["min_rr_after_clip"],
+        "risk.friction_per_share_rt": cfg["risk"]["friction_per_share_rt"],
+        "risk.max_friction_share_of_target": cfg["risk"]["max_friction_share_of_target"],
         "consistency": {k: v for k, v in cfg["consistency"].items() if k != "starting_equity"},
         "session": cfg["session"],
         "symbols": cfg["strategy"]["symbols"],
+        "data_feed": cfg["broker"]["data_feed"],
     }
+    dsr, validated = edge_validated(cfg, trades, state)
     history = [
         {k: h.get(k) for k in ("timestamp", "changes", "status", "baseline_stats", "result_stats")}
         for h in state["history"][-5:]
@@ -168,7 +186,14 @@ def build_user_message(cfg: dict, trades: list[dict], state: dict) -> str:
     compact = [{k: t.get(k) for k in TRADE_FIELDS} for t in trades]
     payload = {
         "summary_stats": asdict(stats),
-        "consistency_limit_max_day_share": cfg["consistency"]["max_day_share"],
+        "consistency_threshold": cfg["consistency"]["threshold"] if cfg["consistency"]["enabled"] else None,
+        "overfitting_check": {
+            "configurations_tested_N": n_trials(state),
+            "deflated_sharpe_ratio": dsr,
+            "dsr_confidence_required": cfg["validation"]["dsr_confidence"],
+            "edge_statistically_validated": validated,
+            "allowed_directions": "qualsiasi" if validated else "solo direzione 'safer' di ciascun parametro",
+        },
         "tunable_parameters": tunables,
         "fixed_parameters_do_not_change": fixed,
         "change_history": history,
@@ -213,8 +238,12 @@ def ask_claude(cfg: dict, system: str, user: str) -> CoachReport:
 
 
 # -------------------------------------------------------------- guardrail
-def validate_adjustments(cfg: dict, report: CoachReport) -> tuple[dict, list[str]]:
-    """Ritorna (modifiche approvate {param: valore}, note). Nessuna fiducia cieca nell'LLM."""
+def validate_adjustments(cfg: dict, report: CoachReport, edge_ok: bool = False) -> tuple[dict, list[str]]:
+    """Ritorna (modifiche approvate {param: valore}, note). Nessuna fiducia cieca nell'LLM.
+
+    Finché il Deflated Sharpe Ratio non supera la soglia (edge_ok=False) sono
+    ammesse solo modifiche che riducono il rischio (direzione `safer`).
+    """
     c = cfg["coach"]
     approved: dict[str, float] = {}
     notes: list[str] = []
@@ -235,6 +264,10 @@ def validate_adjustments(cfg: dict, report: CoachReport) -> tuple[dict, list[str
             notes.append(f"{adj.parameter}: scartato, nessun trade a supporto")
             continue
         current = float(get_path(cfg, adj.parameter))
+        direction = "up" if adj.new_value > current else "down"
+        if not edge_ok and bounds.get("safer") and direction != bounds["safer"]:
+            notes.append(f"{adj.parameter}: scartato, DSR sotto soglia => ammesse solo modifiche '{bounds['safer']}'")
+            continue
         max_step = abs(current) * c["max_relative_change"]
         if bounds.get("integer"):
             max_step = max(max_step, 1.0)  # un intero può sempre muoversi di 1
@@ -281,7 +314,9 @@ def run(dry_run: bool = False, print_prompt: bool = False) -> int:
         log.error("Coach non disponibile, nessuna modifica: %s", exc)
         return 1
 
-    approved, notes = validate_adjustments(cfg, report)
+    dsr, edge_ok = edge_validated(cfg, trades, state)
+    log.info("Deflated Sharpe Ratio %.3f su N=%d configurazioni (edge validato: %s)", dsr, n_trials(state), edge_ok)
+    approved, notes = validate_adjustments(cfg, report, edge_ok)
     log.info("Diagnosi: %s", report.diagnosis)
     log.info("Consistency: %s", report.consistency_assessment)
     for f in report.risk_flags:
@@ -305,7 +340,7 @@ def run(dry_run: bool = False, print_prompt: bool = False) -> int:
             "changes": approved,
             "previous_active": dict(state["active"]),
             "baseline_stats": asdict(journal.compute_stats(trades)),
-            "max_day_share": cfg["consistency"]["max_day_share"],
+            "consistency_threshold": cfg["consistency"]["threshold"] if cfg["consistency"]["enabled"] else 1.0,
             "closed_trades_at_change": len(all_trades),
             "status": "trial",
             "report_file": report_path.name,

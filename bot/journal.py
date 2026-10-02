@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ROOT
+from .validation import drawdown_profile, moments
 
 JOURNAL_PATH = ROOT / "logs" / "trades.jsonl"
 
@@ -45,11 +46,17 @@ class Stats:
     best_day_pnl: float
     best_day_share: float  # quota del giorno migliore sul profitto totale (Consistency)
     max_consecutive_losses: int
+    sharpe_per_trade: float
+    skewness: float
+    kurtosis: float
+    max_drawdown_r: float
+    max_underwater_trades: int
+    triple_penance_recovery_trades: int  # [RICERCA] recupero atteso ~3x la durata del drawdown
 
 
 def compute_stats(trades: list[dict]) -> Stats:
     if not trades:
-        return Stats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return Stats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 3.0, 0.0, 0, 0)
     rs = [float(t.get("r_multiple", 0.0)) for t in trades]
     pnls = [float(t.get("pnl", 0.0)) for t in trades]
     by_day: dict[str, float] = {}
@@ -57,6 +64,8 @@ def compute_stats(trades: list[dict]) -> Stats:
         by_day[str(t.get("day"))] = by_day.get(str(t.get("day")), 0.0) + p
     total = sum(pnls)
     best = max(by_day.values())
+    mu, sd, g3, g4 = moments(rs)
+    max_dd, underwater = drawdown_profile(rs)
     streak = worst = 0
     for p in pnls:
         streak = streak + 1 if p < 0 else 0
@@ -69,4 +78,10 @@ def compute_stats(trades: list[dict]) -> Stats:
         best_day_pnl=round(best, 2),
         best_day_share=round(best / total, 4) if total > 0 else 0.0,
         max_consecutive_losses=worst,
+        sharpe_per_trade=round(mu / sd, 4) if sd else 0.0,
+        skewness=round(g3, 4),
+        kurtosis=round(g4, 4),
+        max_drawdown_r=round(max_dd, 3),
+        max_underwater_trades=underwater,
+        triple_penance_recovery_trades=3 * underwater,
     )

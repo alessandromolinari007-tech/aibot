@@ -1,15 +1,13 @@
-"""Entrata: Liquidity Sweep sui livelli chiave nella sessione di New York.
+"""Innesco: Liquidity Sweep dei livelli strutturali nell'apertura di New York.
 
-Logica (per un setup LONG; lo SHORT è speculare):
-  1. Livelli di liquidità: minimo del giorno precedente (PDL) e minimo del
-     pre-market (PML). Sotto questi livelli si accumulano gli stop dei long.
-  2. Sweep: una barra della killzone buca il livello di almeno
-     `sweep_min_penetration_atr` * ATR (ma non oltre `sweep_max_penetration_atr`,
-     altrimenti è un breakout vero) con volume >= `min_volume_ratio` * media.
-  3. Reclaim: entro `reclaim_max_bars` barre il prezzo CHIUDE di nuovo sopra il
-     livello senza fare un nuovo minimo (la liquidità è stata presa e rifiutata).
-  4. Displacement: la barra di reclaim è rialzista con corpo >= `displacement_body_atr` * ATR.
-  => entrata long alla chiusura della barra di reclaim.
+[RICERCA] "Si identificano i supporti e le resistenze nodali pre-esistenti
+(range overnight/asiatico o la prima candela di 5 minuti post-campanella).
+Il trigger non è la reazione, ma la penetrazione meccanica del livello."
+
+Questo modulo rileva la penetrazione (candidato). La conferma che si tratta di
+uno stop run istituzionale e non di un breakout arriva da microstructure.py
+(OFI + CVD). Nessun indicatore di prezzo tradizionale (MACD, medie mobili):
+l'ATR serve solo a scalare soglie e stop alla volatilità.
 """
 from __future__ import annotations
 
@@ -19,18 +17,19 @@ from datetime import date, time
 import numpy as np
 import pandas as pd
 
-LOW_LEVELS = {"PDL", "PML"}
-HIGH_LEVELS = {"PDH", "PMH"}
+LOW_LEVELS = {"ORL", "ONL", "PDL"}
+HIGH_LEVELS = {"ORH", "ONH", "PDH"}
 
 
 @dataclass(frozen=True)
-class Signal:
+class SweepCandidate:
     symbol: str
-    side: str            # "long" | "short"
+    side: str            # direzione del trade: "long" dopo sweep dei minimi
     level_name: str
     level_price: float
     sweep_extreme: float
-    entry_ref: float
+    sweep_start: pd.Timestamp
+    last_close: float
     atr: float
     bar_time: pd.Timestamp
 
@@ -51,27 +50,25 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 def compute_levels(df: pd.DataFrame, today: date, session_cfg: dict) -> dict[str, float]:
-    """PDH/PDL dalla sessione regolare precedente, PMH/PML dal pre-market di oggi.
-
-    `df` deve avere indice tz-aware nel fuso della sessione (America/New_York).
-    """
+    """ORH/ORL (prima candela da N minuti), ONH/ONL (overnight/pre-market), PDH/PDL."""
     rth_open = parse_hhmm(session_cfg["rth_open"])
     rth_close = parse_hhmm(session_cfg["rth_close"])
-    pm_start = parse_hhmm(session_cfg["premarket_start"])
-    t = df.index.time
-    d = df.index.date
+    on_start = parse_hhmm(session_cfg["overnight_start"])
+    or_end = (pd.Timestamp.combine(today, rth_open) + pd.Timedelta(minutes=session_cfg["opening_range_minutes"])).time()
+    t, d = df.index.time, df.index.date
 
     levels: dict[str, float] = {}
+    orng = df[(d == today) & (t >= rth_open) & (t < or_end)]
+    # L'Opening Range vale solo quando la candela è completa.
+    if not orng.empty and df[(d == today) & (t >= or_end)].shape[0] > 0:
+        levels["ORH"], levels["ORL"] = float(orng["high"].max()), float(orng["low"].min())
+    on = df[(d == today) & (t >= on_start) & (t < rth_open)]
+    if not on.empty:
+        levels["ONH"], levels["ONL"] = float(on["high"].max()), float(on["low"].min())
     rth = df[(t >= rth_open) & (t < rth_close) & (d < today)]
     if not rth.empty:
-        prev_day = rth.index.date.max()
-        prev = rth[rth.index.date == prev_day]
-        levels["PDH"] = float(prev["high"].max())
-        levels["PDL"] = float(prev["low"].min())
-    pm = df[(d == today) & (t >= pm_start) & (t < rth_open)]
-    if not pm.empty:
-        levels["PMH"] = float(pm["high"].max())
-        levels["PML"] = float(pm["low"].min())
+        prev = rth[rth.index.date == rth.index.date.max()]
+        levels["PDH"], levels["PDL"] = float(prev["high"].max()), float(prev["low"].min())
     return levels
 
 
@@ -79,75 +76,56 @@ def in_window(ts: pd.Timestamp, start: str, end: str) -> bool:
     return parse_hhmm(start) <= ts.time() < parse_hhmm(end)
 
 
-def detect_signal(
+def detect_sweep(
     symbol: str,
     df: pd.DataFrame,
     levels: dict[str, float],
     strat_cfg: dict,
     session_cfg: dict,
     used_levels: set[str] | None = None,
-) -> Signal | None:
-    """Valuta l'ULTIMA barra chiusa di `df` come possibile barra di reclaim."""
+) -> SweepCandidate | None:
+    """Cerca una penetrazione 'da sweep' di un livello nelle ultime N barre chiuse."""
     used_levels = used_levels or set()
     period = strat_cfg["atr_period"]
-    if len(df) < period + 21:
+    if len(df) < period + 2:
         return None
-
-    atr_s = atr(df, period)
-    vol_avg = df["volume"].rolling(20).mean().shift(1)
     i = len(df) - 1
-    bar = df.iloc[i]
     ts = df.index[i]
     if not in_window(ts, session_cfg["killzone_start"], session_cfg["killzone_end"]):
         return None
-    a = float(atr_s.iloc[i - 1]) if i > 0 else np.nan  # ATR noto prima della barra
+    a = float(atr(df, period).iloc[i - 1])
     if not np.isfinite(a) or a <= 0:
         return None
 
     pen_min = strat_cfg["sweep_min_penetration_atr"] * a
     pen_max = strat_cfg["sweep_max_penetration_atr"] * a
-    body = float(bar["close"] - bar["open"])
-    max_back = int(strat_cfg["reclaim_max_bars"])
+    start = max(i - strat_cfg["sweep_lookback_bars"] + 1, 1)
+    window = df.iloc[start : i + 1]
     allowed = set(strat_cfg["levels"])
 
     for name, lvl in levels.items():
-        if name not in allowed:
-            continue
-        if strat_cfg.get("one_trade_per_level", True) and name in used_levels:
+        if name not in allowed or (strat_cfg.get("one_trade_per_level", True) and name in used_levels):
             continue
         is_low = name in LOW_LEVELS
-        # Barra di reclaim: chiude dalla parte "giusta" con displacement.
-        if is_low and not (bar["close"] > lvl and body >= strat_cfg["displacement_body_atr"] * a):
+        extreme = float(window["low"].min() if is_low else window["high"].max())
+        pen = (lvl - extreme) if is_low else (extreme - lvl)
+        if not pen_min <= pen <= pen_max:
             continue
-        if not is_low and not (bar["close"] < lvl and -body >= strat_cfg["displacement_body_atr"] * a):
-            continue
-
-        for s in range(i, max(i - max_back, 0) - 1, -1):
-            sweep_bar = df.iloc[s]
-            if not in_window(df.index[s], session_cfg["killzone_start"], session_cfg["killzone_end"]):
-                break
-            window = df.iloc[s : i + 1]
-            if is_low:
-                extreme = float(sweep_bar["low"])
-                pen = lvl - extreme
-                fresh = s > 0 and df.iloc[s - 1]["close"] > lvl
-                is_extreme = extreme <= float(window["low"].min())
-            else:
-                extreme = float(sweep_bar["high"])
-                pen = extreme - lvl
-                fresh = s > 0 and df.iloc[s - 1]["close"] < lvl
-                is_extreme = extreme >= float(window["high"].max())
-            va = vol_avg.iloc[s]
-            vol_ok = np.isfinite(va) and va > 0 and sweep_bar["volume"] >= strat_cfg["min_volume_ratio"] * va
-            if fresh and is_extreme and pen_min <= pen <= pen_max and vol_ok:
-                return Signal(
-                    symbol=symbol,
-                    side="long" if is_low else "short",
-                    level_name=name,
-                    level_price=float(lvl),
-                    sweep_extreme=extreme,
-                    entry_ref=float(bar["close"]),
-                    atr=a,
-                    bar_time=ts,
-                )
+        breached = window["low"] < lvl if is_low else window["high"] > lvl
+        first = int(np.argmax(breached.values))
+        first_idx = start + first
+        prev_close = float(df["close"].iloc[first_idx - 1])
+        if (is_low and prev_close <= lvl) or (not is_low and prev_close >= lvl):
+            continue  # il prezzo era già oltre il livello: non è uno sweep "fresco"
+        return SweepCandidate(
+            symbol=symbol,
+            side="long" if is_low else "short",
+            level_name=name,
+            level_price=float(lvl),
+            sweep_extreme=extreme,
+            sweep_start=df.index[first_idx],
+            last_close=float(df["close"].iloc[i]),
+            atr=a,
+            bar_time=ts,
+        )
     return None

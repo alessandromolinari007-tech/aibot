@@ -1,79 +1,117 @@
 # =============================================================================
 #  CONFIGURAZIONE — NY Liquidity Sweep Bot (Alpaca paper trading)
 # -----------------------------------------------------------------------------
-#  Tutti i valori marcati [RICERCA] vanno calibrati sui dati del report
-#  RICERCA.txt. I valori qui sotto sono default CONSERVATIVI di partenza.
-#  I parametri elencati in `coach.tunable` possono essere modificati
-#  automaticamente da ai_coach.py, ma SOLO dentro i limiti min/max indicati.
+#  Parametri derivati da docs/RICERCA.txt. Il riferimento alla sezione del
+#  report è indicato con [R: ...]. I valori marcati [ASSUNZIONE] non sono nel
+#  report e sono default prudenti scelti per l'adattamento ad Alpaca/azioni.
 # =============================================================================
 
 broker:
-  paper: true                 # MAI false finché il sistema non è validato
-  data_feed: iex              # iex (gratuito) | sip (abbonamento)
+  paper: true                 # bloccato a true nel codice
+  data_feed: iex              # iex (gratuito, solo L1 e volumi parziali) | sip
+  rate_limit_per_minute: 180  # [R: Alpaca ~200 req/min per conto] con margine
+
+# Profilo prop firm da emulare. I valori del profilo sovrascrivono la sezione
+# `risk`/`consistency` corrispondente. [R: tabella Topstep/Apex/FTMO]
+prop_firm: topstep_xfa        # topstep_combine | topstep_xfa | apex | ftmo | none
+
+prop_firm_profiles:
+  topstep_combine:
+    consistency: {enabled: true, threshold: 0.50}       # [R: 50% (o 55%) nella Combine]
+    account_drawdown: {mode: eod_trailing_lock, max_drawdown_pct: 4.0}  # MLL su EOD, si blocca al valore iniziale
+    daily_loss: {pct: 2.0}                               # Personal DLL opzionale
+  topstep_xfa:
+    consistency: {enabled: true, threshold: 0.40}       # [R: XFA Consistency 40%]
+    account_drawdown: {mode: eod_trailing_lock, max_drawdown_pct: 4.0}
+    daily_loss: {pct: 2.0}
+  apex:
+    consistency: {enabled: false, threshold: 1.0}       # [R: nessuna regola % esplicita]
+    account_drawdown: {mode: intraday_trailing, max_drawdown_pct: 5.0}   # HWM con PnL non realizzato
+    daily_loss: {pct: 2.0}
+  ftmo:
+    consistency: {enabled: false, threshold: 1.0}
+    account_drawdown: {mode: static, max_drawdown_pct: 10.0}            # [R: Max Loss 10%]
+    daily_loss: {pct: 5.0}                                               # [R: DLL 5% sul saldo iniziale]
 
 session:
   timezone: America/New_York
-  premarket_start: "04:00"    # inizio range pre-market (livelli di liquidità)
+  overnight_start: "04:00"    # [ASSUNZIONE] proxy dell'Asian/overnight range: Alpaca non ha dati 20:00-04:00 sulle azioni
   rth_open: "09:30"
-  killzone_start: "09:35"     # [RICERCA] finestra in cui cerchiamo lo sweep
-  killzone_end: "11:00"       # [RICERCA]
-  flatten_time: "15:50"       # chiusura forzata di tutte le posizioni
+  opening_range_minutes: 5    # [R: prima candela di 5 minuti post-campanella]
+  killzone_start: "09:35"     # dopo la chiusura della prima candela da 5 min
+  killzone_end: "10:15"       # [R: operatività 09:30-10:15 EST]
+  flatten_time: "15:50"       # [R: Time-Based Exit; 15:10 CT Topstep sui futures, anticipato per le azioni che chiudono alle 16:00 ET]
   rth_close: "16:00"
 
 strategy:
+  # [R: ES/NQ] Alpaca non offre futures: si usano gli ETF proxy SPY (S&P 500) e QQQ (NASDAQ 100).
   symbols: [SPY, QQQ]
-  timeframe_minutes: 5
+  timeframe_minutes: 1
   atr_period: 14
-  # Livelli di liquidità considerati per lo sweep
-  levels: [PDH, PDL, PMH, PML]      # Prev Day High/Low, PreMarket High/Low
-  sweep_min_penetration_atr: 0.05   # [RICERCA] wick oltre il livello di almeno X*ATR
-  sweep_max_penetration_atr: 1.00   # [RICERCA] oltre = breakout reale, non sweep
-  reclaim_max_bars: 2               # [RICERCA] barre entro cui deve chiudere di nuovo dentro
-  displacement_body_atr: 0.50       # [RICERCA] corpo minimo candela di conferma (x ATR)
-  min_volume_ratio: 1.20            # [RICERCA] volume barra sweep / media 20 barre
+  levels: [ORH, ORL, ONH, ONL]      # Opening Range High/Low, Overnight High/Low  [R]
+  sweep_min_penetration_atr: 0.05   # [ASSUNZIONE] penetrazione minima oltre il livello (x ATR)
+  sweep_max_penetration_atr: 1.00   # [ASSUNZIONE] oltre = breakout strutturale (markdown), non sweep
+  sweep_lookback_bars: 5            # barre su cui misurare la finestra dello sweep
   one_trade_per_level: true
+  # --- Validazione microstrutturale [R: OFI Cont-de Larrard + CVD absorption]
+  ofi_baseline_minutes: 15          # [ASSUNZIONE] finestra per la "norma" dell'OFI
+  ofi_imbalance_factor: 3.0         # [R: sbilanciamento del 300% oltre la norma]
+  require_cvd_absorption: true      # [R: il CVD non deve formare un minimo decrescente]
+  min_trades_after_extreme: 20      # [ASSUNZIONE] campione minimo per giudicare il CVD
+  poc_bucket: 0.01                  # granularità del volume profile per il nodo ad alta densità
+  # --- Uscita [R: TP quando l'OFI torna neutrale o mostra assorbimento avverso]
+  ofi_exit_window_minutes: 2
+  ofi_neutral_threshold: 0.25       # |OFI| / norma sotto questa soglia = neutralità
+  ofi_exit_min_r: 0.5               # [ASSUNZIONE] l'uscita OFI scatta solo se il trade ha almeno coperto la friction
+
+execution:
+  entry_order: limit                # [R: ingresso solo con ordini Limit sui nodi ad alta densità]
+  entry_timeout_seconds: 120        # [ASSUNZIONE] limit non eseguito entro il timeout => cancellato
 
 risk:
-  risk_per_trade_pct: 0.50          # [RICERCA] % equity rischiata per trade
-  atr_stop_mult: 1.50               # [RICERCA] stop minimo = entry -/+ k*ATR
-  stop_buffer_atr: 0.10             # buffer oltre l'estremo dello sweep
-  take_profit_r: 2.00               # [RICERCA] TP in multipli di R
-  min_rr_after_clip: 1.00           # se il TP tagliato dalla consistency scende sotto, salta il trade
-  breakeven_at_r: 1.00              # sposta lo stop a breakeven a +1R
-  trail_atr_mult: 1.00              # poi trailing a k*ATR dal prezzo
-  daily_loss_limit_pct: 2.00        # [RICERCA] stop di giornata in perdita
-  daily_profit_target_pct: 1.50     # [RICERCA] obiettivo giornaliero: raggiunto => stop
-  max_trades_per_day: 3
-  max_consecutive_losses: 2
-  max_position_notional_pct: 50.0   # cap esposizione per singola posizione
+  atr_stop_mult: 1.00               # stop minimo = k*ATR (lo stop è comunque oltre la coda dello sweep)
+  stop_buffer_atr: 0.10
+  max_attempts_per_day: 3           # [R: DynamicRiskSplitter max_attempts=3]
+  dll_friction_buffer: 0.85         # [R: usa l'85% del DLL, 15% per slippage e commissioni]
+  hard_take_profit_r: 3.0           # TP di sicurezza lato server (l'uscita primaria è l'OFI)
+  min_rr_after_clip: 1.0
+  max_consecutive_losses: 2         # [ASSUNZIONE]
+  max_position_notional_pct: 50.0
+  # [R: DrawdownDampenerAndTimer] trailing sul picco di PnL non realizzato del trade
+  dampener_activation_r: 1.0        # si attiva quando il trade ha guadagnato 1R
+  dampener_trailing_atr: 1.0        # distanza dal picco = k * ATR * qty (stop dinamico ATR)
+  # [R: Friction] costi round-trip. ES: ~$4.10/contratto. Azioni Alpaca: spread + fee regolamentari.
+  friction_per_share_rt: 0.01       # [ASSUNZIONE] 1 cent RT su SPY/QQQ
+  max_friction_share_of_target: 0.10  # [R: friction 16-30% del lordo = rovina] => max 10%
 
 consistency:
-  # Consistency Rule (stile prop firm): nessun giorno può valere più di
-  # `max_day_share` del profitto totale. [RICERCA]
-  enabled: true
-  max_day_share: 0.30               # [RICERCA] es. 30%
-  profit_target_pct: 8.00           # [RICERCA] obiettivo totale del periodo di valutazione
-  safety_margin: 0.90               # usa solo il 90% del budget consentito
+  profit_target_pct: 6.0            # obiettivo del periodo di valutazione (es. $3000 su $50k)  [ASSUNZIONE]
+  operational_buffer: 0.90          # [R: buffer di sicurezza del 10%]
   starting_equity: null             # null = equity al primo avvio (salvata in state/)
+
+validation:
+  # [R: Deflated Sharpe Ratio] soglia di confidenza
+  dsr_confidence: 0.95
 
 coach:
   model: claude-opus-5-5
   effort: high
-  lookback_trades: 30
-  min_trades_required: 10           # sotto questa soglia il coach non modifica nulla
-  max_relative_change: 0.20         # max ±20% per parametro per iterazione
-  max_changes_per_run: 3
-  rollback_if_expectancy_drops_r: 0.15   # rollback se l'expectancy (R) peggiora oltre questa soglia
+  # [R: Walk-Forward 80/20] 40 trade in-sample per proporre, 10 out-of-sample per validare
+  lookback_trades: 40
+  min_trades_required: 10
+  max_relative_change: 0.20
+  max_changes_per_run: 2
+  rollback_if_expectancy_drops_r: 0.10
   use_server_fallbacks: true
-  tunable:                          # unico perimetro modificabile dall'AI
-    strategy.sweep_min_penetration_atr: {min: 0.02, max: 0.30}
-    strategy.reclaim_max_bars:          {min: 1,    max: 4, integer: true}
-    strategy.displacement_body_atr:     {min: 0.20, max: 1.20}
-    strategy.min_volume_ratio:          {min: 1.00, max: 2.50}
-    risk.atr_stop_mult:                 {min: 1.00, max: 3.00}
-    risk.take_profit_r:                 {min: 1.00, max: 4.00}
-    risk.breakeven_at_r:                {min: 0.50, max: 2.00}
-    risk.trail_atr_mult:                {min: 0.50, max: 2.50}
-    risk.daily_profit_target_pct:       {min: 0.50, max: 2.50}
-    risk.risk_per_trade_pct:            {min: 0.10, max: 1.00}
-    risk.max_trades_per_day:            {min: 1,    max: 5, integer: true}
+  # Perimetro modificabile dall'AI. `safer` = direzione che RIDUCE il rischio:
+  # finché il DSR non supera la soglia, sono ammesse solo modifiche in quella direzione.
+  tunable:
+    strategy.sweep_min_penetration_atr: {min: 0.02, max: 0.30, safer: up}
+    strategy.ofi_imbalance_factor:      {min: 2.0,  max: 6.0,  safer: up}
+    strategy.ofi_neutral_threshold:     {min: 0.10, max: 0.60, safer: up}
+    strategy.ofi_exit_min_r:            {min: 0.25, max: 1.50, safer: down}
+    risk.atr_stop_mult:                 {min: 0.75, max: 2.50, safer: up}
+    risk.hard_take_profit_r:            {min: 1.50, max: 4.00, safer: down}
+    risk.dampener_activation_r:         {min: 0.50, max: 2.00, safer: down}
+    risk.dampener_trailing_atr:         {min: 0.50, max: 2.50, safer: down}
+    risk.max_attempts_per_day:          {min: 2,    max: 5, integer: true, safer: up}

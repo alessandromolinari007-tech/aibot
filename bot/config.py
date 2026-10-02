@@ -60,8 +60,25 @@ def apply_overrides(base: dict, overrides: dict) -> dict:
     return cfg
 
 
+def resolve_prop_firm(cfg: dict) -> dict:
+    """Applica il profilo prop firm scelto (consistency, drawdown, DLL)."""
+    cfg = copy.deepcopy(cfg)
+    name = cfg.get("prop_firm", "none")
+    profile = cfg.get("prop_firm_profiles", {}).get(name)
+    if profile is None:
+        profile = {
+            "consistency": {"enabled": False, "threshold": 1.0},
+            "account_drawdown": {"mode": "static", "max_drawdown_pct": 10.0},
+            "daily_loss": {"pct": 5.0},
+        }
+    cfg["consistency"].update(profile["consistency"])
+    cfg["account_drawdown"] = dict(profile["account_drawdown"])
+    cfg["risk"]["daily_loss_limit_pct"] = profile["daily_loss"]["pct"]
+    return cfg
+
+
 def load_config(path: Path = CONFIG_PATH, with_overrides: bool = True) -> dict:
-    base = yaml.safe_load(path.read_text())
+    base = resolve_prop_firm(yaml.safe_load(path.read_text()))
     if not with_overrides:
         return base
     return apply_overrides(base, load_overrides())
